@@ -44,13 +44,14 @@ TRANSIENT_EXCEPTIONS = _build_transient_exceptions()
 
 class AsyncCouchbaseFareRepository:
     """
-    Async Couchbase repository for high-throughput fare ingestion.
+    Async Couchbase repository.
 
-    Features:
+    Supports:
+    - retry/backoff
     - async KV operations
-    - retry/backoff for transient failures
-    - hash-only collection support
-    - one shared batch_control document updated by all workers using CAS
+    - hash-only collection
+    - shared batch_control document
+    - chunked/bulk-style pipeline from processor
     """
 
     def __init__(self, config: CouchbaseConfig):
@@ -191,6 +192,16 @@ class AsyncCouchbaseFareRepository:
         except DocumentNotFoundException:
             return None
 
+    async def get_hash(self, key: str) -> dict[str, Any] | None:
+        async def op():
+            return await self.hashes.get(key)
+
+        try:
+            result = await self._retry("get_hash", op)
+            return self.content_as_dict(result)
+        except DocumentNotFoundException:
+            return None
+
     async def insert_current(self, key: str, doc: dict[str, Any]) -> bool:
         async def op():
             return await self.current.insert(key, doc)
@@ -218,16 +229,6 @@ class AsyncCouchbaseFareRepository:
         except CasMismatchException:
             return False
 
-    async def get_hash(self, key: str) -> dict[str, Any] | None:
-        async def op():
-            return await self.hashes.get(key)
-
-        try:
-            result = await self._retry("get_hash", op)
-            return self.content_as_dict(result)
-        except DocumentNotFoundException:
-            return None
-
     async def upsert_hash(self, key: str, doc: dict[str, Any]) -> None:
         async def op():
             return await self.hashes.upsert(key, doc)
@@ -244,17 +245,17 @@ class AsyncCouchbaseFareRepository:
         except DocumentExistsException:
             return False
 
-    async def upsert_batch(self, key: str, doc: dict[str, Any]) -> None:
-        async def op():
-            return await self.batch.upsert(key, doc)
-
-        await self._retry("upsert_batch", op)
-
     async def insert_deadletter(self, key: str, doc: dict[str, Any]) -> None:
         async def op():
             return await self.deadletter.upsert(key, doc)
 
         await self._retry("insert_deadletter", op)
+
+    async def upsert_batch(self, key: str, doc: dict[str, Any]) -> None:
+        async def op():
+            return await self.batch.upsert(key, doc)
+
+        await self._retry("upsert_batch", op)
 
     async def upsert_batch_worker_stats(
         self,
@@ -263,16 +264,6 @@ class AsyncCouchbaseFareRepository:
         worker_count: int,
         worker_doc: dict[str, Any],
     ) -> None:
-        """
-        Update one shared batch_control document.
-
-        Each worker writes its own stats under:
-
-            workers.<worker_id>
-
-        This method recalculates aggregate totals on every update.
-        CAS is used to prevent workers from overwriting each other's updates.
-        """
         worker_key = str(worker_id)
 
         for attempt in range(self.max_retries + 1):
@@ -339,6 +330,7 @@ class AsyncCouchbaseFareRepository:
             "hash_upsert_count",
             "completed_count",
             "in_flight_count",
+            "hash_backfill_count",
         ]
 
         totals: dict[str, Any] = {}
@@ -385,10 +377,11 @@ class AsyncCouchbaseFareRepository:
             batch_doc["status"] = "PROCESSING"
             batch_doc["completed_at"] = None
         else:
-            if totals["failed_count"] > 0:
-                batch_doc["status"] = "COMPLETED_WITH_ERRORS"
-            else:
-                batch_doc["status"] = "COMPLETED"
+            batch_doc["status"] = (
+                "COMPLETED_WITH_ERRORS"
+                if totals["failed_count"] > 0
+                else "COMPLETED"
+            )
 
             completed_times = [
                 worker.get("completed_at")

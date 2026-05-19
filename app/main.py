@@ -13,90 +13,50 @@ def parse_args() -> argparse.Namespace:
         description="Process airline fare CSV batches into Couchbase."
     )
 
-    parser.add_argument(
-        "--csv",
-        required=True,
-        help="Path to the CSV file to process.",
-    )
+    parser.add_argument("--csv", required=True)
+    parser.add_argument("--batch-id", required=True)
 
-    parser.add_argument(
-        "--batch-id",
-        required=True,
-        help="Unique batch id, for example batch::10m-base.",
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Parse and build documents without writing to Couchbase.",
-    )
-
-    parser.add_argument(
-        "--preview",
-        type=int,
-        default=0,
-        help="In dry-run mode, print the first N generated docs.",
-    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--preview", type=int, default=0)
 
     parser.add_argument(
         "--concurrency",
         type=int,
         default=1000,
-        help="Maximum number of in-flight row processing tasks per worker.",
-    )
-
-    parser.add_argument(
-        "--progress-every",
-        type=int,
-        default=10000,
-        help="Print progress every N scanned rows.",
-    )
-
-    parser.add_argument(
-        "--batch-control-every",
-        type=int,
-        default=100000,
-        help="Update batch_control every N scanned rows.",
-    )
-
-    parser.add_argument(
-        "--skip-new-history",
-        action="store_true",
         help=(
-            "Do not write NEW_FARE history events for new rows. "
-            "Useful for faster baseline seeding."
+            "Legacy compatibility. Used as chunk size unless --chunk-size is supplied."
         ),
     )
 
     parser.add_argument(
-        "--initial-load",
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Rows per bulk pipeline chunk. Defaults to --concurrency.",
+    )
+
+    parser.add_argument(
+        "--chunk-concurrency",
+        type=int,
+        default=2,
+        help="Number of chunks processed concurrently per worker.",
+    )
+
+    parser.add_argument("--progress-every", type=int, default=10000)
+    parser.add_argument("--batch-control-every", type=int, default=100000)
+
+    parser.add_argument("--skip-new-history", action="store_true")
+    parser.add_argument("--initial-load", action="store_true")
+
+    parser.add_argument(
+        "--hash-backfill",
         action="store_true",
-        help=(
-            "Fast baseline mode. Upserts current documents without reading existing "
-            "documents and without writing NEW_FARE history."
-        ),
+        help="Only populate fare_hashes from the CSV. Does not write current/history.",
     )
 
-    parser.add_argument(
-        "--max-cas-retries",
-        type=int,
-        default=3,
-        help="Maximum CAS retry attempts for concurrent updates.",
-    )
-
-    parser.add_argument(
-        "--worker-count",
-        type=int,
-        default=1,
-        help="Total number of parallel workers.",
-    )
-
-    parser.add_argument(
-        "--worker-id",
-        type=int,
-        default=0,
-        help="This worker's zero-based worker id.",
-    )
+    parser.add_argument("--max-cas-retries", type=int, default=3)
+    parser.add_argument("--worker-count", type=int, default=1)
+    parser.add_argument("--worker-id", type=int, default=0)
 
     return parser.parse_args()
 
@@ -110,6 +70,9 @@ async def async_main() -> int:
     if args.worker_id < 0 or args.worker_id >= args.worker_count:
         raise ValueError("--worker-id must be between 0 and worker-count - 1")
 
+    if args.initial_load and args.hash_backfill:
+        raise ValueError("Use either --initial-load or --hash-backfill, not both.")
+
     repo = None
 
     try:
@@ -118,16 +81,20 @@ async def async_main() -> int:
             repo = AsyncCouchbaseFareRepository(config)
             await repo.connect()
 
+        chunk_size = args.chunk_size if args.chunk_size is not None else args.concurrency
+
         processor = AsyncFareBatchProcessor(
             repository=repo,
             dry_run=args.dry_run,
             preview=args.preview,
-            concurrency=args.concurrency,
+            chunk_size=chunk_size,
+            chunk_concurrency=args.chunk_concurrency,
             progress_every=args.progress_every,
             batch_control_every=args.batch_control_every,
             max_cas_retries=args.max_cas_retries,
             skip_new_history=args.skip_new_history,
             initial_load=args.initial_load,
+            hash_backfill=args.hash_backfill,
             worker_count=args.worker_count,
             worker_id=args.worker_id,
         )

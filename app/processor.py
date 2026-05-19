@@ -44,6 +44,7 @@ class BatchStats:
     hash_miss_count: int = 0
     hash_changed_count: int = 0
     hash_upsert_count: int = 0
+    hash_backfill_count: int = 0
 
     started_at: str = ""
     completed_at: str | None = None
@@ -63,24 +64,28 @@ class AsyncFareBatchProcessor:
         *,
         dry_run: bool = False,
         preview: int = 0,
-        concurrency: int = 1000,
+        chunk_size: int = 1000,
+        chunk_concurrency: int = 2,
         progress_every: int = 10000,
         batch_control_every: int = 100000,
         max_cas_retries: int = 3,
         skip_new_history: bool = False,
         initial_load: bool = False,
+        hash_backfill: bool = False,
         worker_count: int = 1,
         worker_id: int = 0,
     ):
         self.repository = repository
         self.dry_run = dry_run
         self.preview = preview
-        self.concurrency = concurrency
+        self.chunk_size = chunk_size
+        self.chunk_concurrency = chunk_concurrency
         self.progress_every = progress_every
         self.batch_control_every = batch_control_every
         self.max_cas_retries = max_cas_retries
         self.skip_new_history = skip_new_history
         self.initial_load = initial_load
+        self.hash_backfill = hash_backfill
         self.worker_count = worker_count
         self.worker_id = worker_id
 
@@ -100,7 +105,8 @@ class AsyncFareBatchProcessor:
 
         await self._write_batch_control(stats)
 
-        pending: set[asyncio.Task] = set()
+        pending_chunks: set[asyncio.Task] = set()
+        chunk: list[tuple[int, dict[str, Any]]] = []
 
         for row_number, row in iter_csv_rows(csv_path):
             async with self._stats_lock:
@@ -115,24 +121,25 @@ class AsyncFareBatchProcessor:
             async with self._stats_lock:
                 stats.received_count += 1
 
-            task = asyncio.create_task(
-                self._process_row_safely(
-                    row=row,
-                    row_number=row_number,
-                    source_file=source_file,
-                    batch_id=batch_id,
-                    stats=stats,
+            chunk.append((row_number, row))
+
+            if len(chunk) >= self.chunk_size:
+                task = asyncio.create_task(
+                    self._process_chunk_safely(
+                        chunk=chunk,
+                        source_file=source_file,
+                        batch_id=batch_id,
+                        stats=stats,
+                    )
                 )
-            )
+                pending_chunks.add(task)
+                chunk = []
 
-            pending.add(task)
-
-            if len(pending) >= self.concurrency:
-                done, pending = await asyncio.wait(
-                    pending,
+            if len(pending_chunks) >= self.chunk_concurrency:
+                done, pending_chunks = await asyncio.wait(
+                    pending_chunks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-
                 for done_task in done:
                     await done_task
 
@@ -143,8 +150,20 @@ class AsyncFareBatchProcessor:
                 self._update_runtime_metrics(stats, started_perf)
                 await self._write_batch_control(stats)
 
-        if pending:
-            done, _ = await asyncio.wait(pending)
+        if chunk:
+            pending_chunks.add(
+                asyncio.create_task(
+                    self._process_chunk_safely(
+                        chunk=chunk,
+                        source_file=source_file,
+                        batch_id=batch_id,
+                        stats=stats,
+                    )
+                )
+            )
+
+        if pending_chunks:
+            done, _ = await asyncio.wait(pending_chunks)
             for done_task in done:
                 await done_task
 
@@ -173,212 +192,469 @@ class AsyncFareBatchProcessor:
     def _hash_key_for_fare_key(fare_key: str) -> str:
         return f"hash::{fare_key}"
 
-    async def _process_row_safely(
+    async def _process_chunk_safely(
         self,
         *,
-        row: dict[str, Any],
-        row_number: int,
+        chunk: list[tuple[int, dict[str, Any]]],
         source_file: str,
         batch_id: str,
         stats: BatchStats,
     ) -> None:
         try:
-            result = await self._process_row(
-                row=row,
-                row_number=row_number,
+            await self._process_chunk(
+                chunk=chunk,
                 source_file=source_file,
                 batch_id=batch_id,
                 stats=stats,
             )
 
-            async with self._stats_lock:
-                stats.processed_count += 1
-
-                if result == "inserted":
-                    stats.inserted_count += 1
-                elif result == "changed":
-                    stats.changed_count += 1
-                elif result == "unchanged":
-                    stats.unchanged_count += 1
-                elif result == "skipped_new_history":
-                    stats.inserted_count += 1
-                    stats.skipped_new_history_count += 1
-
         except Exception as exc:
+            # If something unexpected takes out the entire chunk,
+            # write each row to dead_letter so no data disappears.
             async with self._stats_lock:
-                stats.failed_count += 1
+                stats.failed_count += len(chunk)
 
-            print("")
-            print("=" * 80, flush=True)
-            print(f"[error] Failed processing row {row_number}", flush=True)
-            print(f"[error] {type(exc).__name__}: {exc}", flush=True)
-            print(traceback.format_exc(limit=8), flush=True)
-            print("=" * 80, flush=True)
-            print("")
+            for row_number, row in chunk:
+                await self._write_deadletter(
+                    batch_id=batch_id,
+                    source_file=source_file,
+                    row_number=row_number,
+                    row=row,
+                    error=str(exc),
+                    traceback_text=traceback.format_exc(limit=8),
+                )
 
-            await self._write_deadletter(
-                batch_id=batch_id,
-                source_file=source_file,
-                row_number=row_number,
-                row=row,
-                error=str(exc),
-                traceback_text=traceback.format_exc(limit=8),
-            )
-
-    async def _process_row(
+    async def _process_chunk(
         self,
         *,
-        row: dict[str, Any],
-        row_number: int,
+        chunk: list[tuple[int, dict[str, Any]]],
         source_file: str,
         batch_id: str,
         stats: BatchStats,
-    ) -> str:
+    ) -> None:
         now = utc_now_iso()
 
-        parts = row_to_parts(
-            row=row,
-            batch_id=batch_id,
-            source_file=source_file,
-            row_number=row_number,
-        )
+        items: list[dict[str, Any]] = []
 
-        new_doc = build_current_document(parts=parts, now=now)
-        hash_key = self._hash_key_for_fare_key(parts.fare_key)
+        for row_number, row in chunk:
+            try:
+                parts = row_to_parts(
+                    row=row,
+                    batch_id=batch_id,
+                    source_file=source_file,
+                    row_number=row_number,
+                )
 
-        hash_doc = {
-            "type": "fare_hash",
-            "fare_key": parts.fare_key,
-            "source_key": parts.source_key,
-            "business_hash": parts.business_hash,
-            "last_batch_id": batch_id,
-            "updated_at": now,
-        }
+                current_doc = build_current_document(parts=parts, now=now)
+                hash_key = self._hash_key_for_fare_key(parts.fare_key)
+
+                hash_doc = {
+                    "type": "fare_hash",
+                    "fare_key": parts.fare_key,
+                    "source_key": parts.source_key,
+                    "business_hash": parts.business_hash,
+                    "last_batch_id": batch_id,
+                    "updated_at": now,
+                }
+
+                items.append(
+                    {
+                        "row_number": row_number,
+                        "row": row,
+                        "parts": parts,
+                        "current_doc": current_doc,
+                        "hash_key": hash_key,
+                        "hash_doc": hash_doc,
+                    }
+                )
+
+            except Exception as exc:
+                async with self._stats_lock:
+                    stats.failed_count += 1
+
+                await self._write_deadletter(
+                    batch_id=batch_id,
+                    source_file=source_file,
+                    row_number=row_number,
+                    row=row,
+                    error=str(exc),
+                    traceback_text=traceback.format_exc(limit=8),
+                )
+
+        if not items:
+            return
 
         if self.dry_run:
-            if row_number <= self.preview:
+            await self._apply_counts(
+                stats,
+                processed=len(items),
+                inserted=len(items),
+            )
+            return
+
+        if self.hash_backfill:
+            await self._bulk_hash_backfill(items, stats)
+            return
+
+        if self.initial_load:
+            await self._bulk_initial_load(items, stats)
+            return
+
+        await self._bulk_compare_and_apply(
+            items=items,
+            stats=stats,
+            batch_id=batch_id,
+            now=now,
+        )
+
+    async def _bulk_hash_backfill(
+        self,
+        items: list[dict[str, Any]],
+        stats: BatchStats,
+    ) -> None:
+        results = await asyncio.gather(
+            *[
+                self.repository.upsert_hash(item["hash_key"], item["hash_doc"])
+                for item in items
+            ],
+            return_exceptions=True,
+        )
+
+        processed = 0
+        failed = 0
+
+        for item, result in zip(items, results):
+            if isinstance(result, Exception):
+                failed += 1
+                await self._write_deadletter(
+                    batch_id=stats.batch_id,
+                    source_file=stats.source_file,
+                    row_number=item["row_number"],
+                    row=item["row"],
+                    error=str(result),
+                    traceback_text="bulk hash backfill failure",
+                )
+            else:
+                processed += 1
+
+        await self._apply_counts(
+            stats,
+            processed=processed,
+            failed=failed,
+            hash_backfill=processed,
+            hash_upsert=processed,
+        )
+
+    async def _bulk_initial_load(
+        self,
+        items: list[dict[str, Any]],
+        stats: BatchStats,
+    ) -> None:
+        current_results = await asyncio.gather(
+            *[
+                self.repository.upsert_current(
+                    item["parts"].fare_key,
+                    item["current_doc"],
+                )
+                for item in items
+            ],
+            return_exceptions=True,
+        )
+
+        hash_results = await asyncio.gather(
+            *[
+                self.repository.upsert_hash(item["hash_key"], item["hash_doc"])
+                for item in items
+            ],
+            return_exceptions=True,
+        )
+
+        processed = 0
+        failed = 0
+
+        for item, current_result, hash_result in zip(items, current_results, hash_results):
+            if isinstance(current_result, Exception) or isinstance(hash_result, Exception):
+                failed += 1
+                error = current_result if isinstance(current_result, Exception) else hash_result
+                await self._write_deadletter(
+                    batch_id=stats.batch_id,
+                    source_file=stats.source_file,
+                    row_number=item["row_number"],
+                    row=item["row"],
+                    error=str(error),
+                    traceback_text="bulk initial-load failure",
+                )
+            else:
+                processed += 1
+
+        await self._apply_counts(
+            stats,
+            processed=processed,
+            failed=failed,
+            inserted=processed,
+            skipped_new_history=processed,
+            hash_upsert=processed,
+        )
+
+    async def _bulk_compare_and_apply(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        stats: BatchStats,
+        batch_id: str,
+        now: str,
+    ) -> None:
+        hash_results = await asyncio.gather(
+            *[
+                self.repository.get_hash(item["hash_key"])
+                for item in items
+            ],
+            return_exceptions=True,
+        )
+
+        hash_matches: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        hash_failures: list[tuple[dict[str, Any], Exception]] = []
+
+        for item, result in zip(items, hash_results):
+            if isinstance(result, Exception):
+                hash_failures.append((item, result))
+                continue
+
+            if result is None:
+                item["hash_state"] = "miss"
+                candidates.append(item)
+                continue
+
+            existing_hash = result.get("business_hash")
+
+            if existing_hash == item["parts"].business_hash:
+                hash_matches.append(item)
+            else:
+                item["hash_state"] = "changed"
+                candidates.append(item)
+
+        for item, exc in hash_failures:
+            await self._write_deadletter(
+                batch_id=batch_id,
+                source_file=stats.source_file,
+                row_number=item["row_number"],
+                row=item["row"],
+                error=str(exc),
+                traceback_text="bulk hash get failure",
+            )
+
+        processed = len(hash_matches)
+        failed = len(hash_failures)
+        unchanged = len(hash_matches)
+        hash_match_count = len(hash_matches)
+        hash_miss_count = sum(1 for item in candidates if item.get("hash_state") == "miss")
+        hash_changed_count = sum(1 for item in candidates if item.get("hash_state") == "changed")
+
+        if not candidates:
+            await self._apply_counts(
+                stats,
+                processed=processed,
+                failed=failed,
+                unchanged=unchanged,
+                hash_match=hash_match_count,
+            )
+            return
+
+        current_results = await asyncio.gather(
+            *[
+                self.repository.get_current(item["parts"].fare_key)
+                for item in candidates
+            ],
+            return_exceptions=True,
+        )
+
+        apply_tasks = []
+
+        for item, current_result in zip(candidates, current_results):
+            if isinstance(current_result, Exception):
+                failed += 1
+                apply_tasks.append(
+                    self._write_deadletter(
+                        batch_id=batch_id,
+                        source_file=stats.source_file,
+                        row_number=item["row_number"],
+                        row=item["row"],
+                        error=str(current_result),
+                        traceback_text="bulk current get failure",
+                    )
+                )
+                continue
+
+            apply_tasks.append(
+                self._apply_candidate(
+                    item=item,
+                    current_result=current_result,
+                    batch_id=batch_id,
+                    now=now,
+                    stats=stats,
+                )
+            )
+
+        apply_results = await asyncio.gather(
+            *apply_tasks,
+            return_exceptions=True,
+        )
+
+        inserted = 0
+        changed = 0
+        candidate_unchanged = 0
+        hash_upsert = 0
+
+        for item, result in zip(candidates, apply_results):
+            if isinstance(result, Exception):
+                failed += 1
+                await self._write_deadletter(
+                    batch_id=batch_id,
+                    source_file=stats.source_file,
+                    row_number=item["row_number"],
+                    row=item["row"],
+                    error=str(result),
+                    traceback_text="bulk candidate apply failure",
+                )
+                continue
+
+            processed += 1
+
+            if result == "inserted":
+                inserted += 1
+                hash_upsert += 1
+            elif result == "changed":
+                changed += 1
+                hash_upsert += 1
+            elif result == "unchanged":
+                candidate_unchanged += 1
+                hash_upsert += 1
+
+        await self._apply_counts(
+            stats,
+            processed=processed,
+            failed=failed,
+            inserted=inserted,
+            changed=changed,
+            unchanged=unchanged + candidate_unchanged,
+            hash_match=hash_match_count,
+            hash_miss=hash_miss_count,
+            hash_changed=hash_changed_count,
+            hash_upsert=hash_upsert,
+        )
+
+    async def _apply_candidate(
+        self,
+        *,
+        item: dict[str, Any],
+        current_result: Any,
+        batch_id: str,
+        now: str,
+        stats: BatchStats,
+    ) -> str:
+        parts = item["parts"]
+        current_doc = item["current_doc"]
+        hash_key = item["hash_key"]
+        hash_doc = item["hash_doc"]
+
+        if current_result is None:
+            if not self.skip_new_history:
                 history_doc = build_history_document(
                     parts=parts,
                     change_type="NEW_FARE",
                     old_doc=None,
-                    new_doc=new_doc,
+                    new_doc=current_doc,
                     batch_id=batch_id,
                     now=now,
                 )
 
-                print("\n--- DRY RUN CURRENT DOC ---")
-                print_json(new_doc)
-
-                print("\n--- DRY RUN HASH DOC ---")
-                print_json(hash_doc)
-
-                print("\n--- DRY RUN HISTORY DOC ---")
-                print_json(history_doc)
-
-            return "inserted"
-
-        if self.initial_load:
-            await self.repository.upsert_current(parts.fare_key, new_doc)
-            await self.repository.upsert_hash(hash_key, hash_doc)
-
-            async with self._stats_lock:
-                stats.hash_upsert_count += 1
-
-            return "skipped_new_history"
-
-        existing_hash_doc = await self.repository.get_hash(hash_key)
-
-        if existing_hash_doc is not None:
-            existing_hash = existing_hash_doc.get("business_hash")
-
-            if existing_hash == parts.business_hash:
-                async with self._stats_lock:
-                    stats.hash_match_count += 1
-                return "unchanged"
-
-            async with self._stats_lock:
-                stats.hash_changed_count += 1
-        else:
-            async with self._stats_lock:
-                stats.hash_miss_count += 1
-
-        for _attempt in range(self.max_cas_retries + 1):
-            existing = await self.repository.get_current(parts.fare_key)
-
-            if existing is None:
-                if not self.skip_new_history:
-                    history_doc = build_history_document(
-                        parts=parts,
-                        change_type="NEW_FARE",
-                        old_doc=None,
-                        new_doc=new_doc,
-                        batch_id=batch_id,
-                        now=now,
-                    )
-
-                    await self.repository.insert_history(
-                        history_key(parts, batch_id),
-                        history_doc,
-                    )
-
-                inserted_current = await self.repository.insert_current(
-                    parts.fare_key,
-                    new_doc,
+                await self.repository.insert_history(
+                    history_key(parts, batch_id),
+                    history_doc,
                 )
 
-                if inserted_current:
-                    await self.repository.upsert_hash(hash_key, hash_doc)
-                    async with self._stats_lock:
-                        stats.hash_upsert_count += 1
-
-                    if self.skip_new_history:
-                        return "skipped_new_history"
-                    return "inserted"
-
-                continue
-
-            old_doc, cas = self._coerce_existing_doc(existing)
-            old_hash = old_doc.get("business_hash")
-
-            if old_hash == parts.business_hash:
-                await self.repository.upsert_hash(hash_key, hash_doc)
-                async with self._stats_lock:
-                    stats.hash_upsert_count += 1
-                return "unchanged"
-
-            updated_doc = build_current_document(
-                parts=parts,
-                now=now,
-                existing_created_at=old_doc.get("created_at"),
-            )
-
-            history_doc = build_history_document(
-                parts=parts,
-                change_type="UPDATED_FARE",
-                old_doc=old_doc,
-                new_doc=updated_doc,
-                batch_id=batch_id,
-                now=now,
-            )
-
-            await self.repository.insert_history(
-                history_key(parts, batch_id),
-                history_doc,
-            )
-
-            replaced = await self.repository.replace_current(
+            inserted = await self.repository.insert_current(
                 parts.fare_key,
-                updated_doc,
-                cas=cas,
+                current_doc,
             )
 
-            if replaced:
-                await self.repository.upsert_hash(hash_key, hash_doc)
-                async with self._stats_lock:
-                    stats.hash_upsert_count += 1
-                return "changed"
+            await self.repository.upsert_hash(hash_key, hash_doc)
 
-        raise RuntimeError(f"CAS retries exceeded for {parts.fare_key}")
+            if inserted:
+                return "inserted"
+
+            return "unchanged"
+
+        old_doc, cas = self._coerce_existing_doc(current_result)
+        old_hash = old_doc.get("business_hash")
+
+        if old_hash == parts.business_hash:
+            await self.repository.upsert_hash(hash_key, hash_doc)
+            return "unchanged"
+
+        updated_doc = build_current_document(
+            parts=parts,
+            now=now,
+            existing_created_at=old_doc.get("created_at"),
+        )
+
+        history_doc = build_history_document(
+            parts=parts,
+            change_type="UPDATED_FARE",
+            old_doc=old_doc,
+            new_doc=updated_doc,
+            batch_id=batch_id,
+            now=now,
+        )
+
+        await self.repository.insert_history(
+            history_key(parts, batch_id),
+            history_doc,
+        )
+
+        replaced = await self.repository.replace_current(
+            parts.fare_key,
+            updated_doc,
+            cas=cas,
+        )
+
+        if not replaced:
+            # CAS mismatch. Let retry logic happen at row/chunk level later if needed.
+            # For now, surface as exception to dead_letter so we can see if this occurs.
+            raise RuntimeError(f"CAS mismatch for {parts.fare_key}")
+
+        await self.repository.upsert_hash(hash_key, hash_doc)
+        return "changed"
+
+    async def _apply_counts(
+        self,
+        stats: BatchStats,
+        *,
+        processed: int = 0,
+        failed: int = 0,
+        inserted: int = 0,
+        changed: int = 0,
+        unchanged: int = 0,
+        skipped_new_history: int = 0,
+        hash_match: int = 0,
+        hash_miss: int = 0,
+        hash_changed: int = 0,
+        hash_upsert: int = 0,
+        hash_backfill: int = 0,
+    ) -> None:
+        async with self._stats_lock:
+            stats.processed_count += processed
+            stats.failed_count += failed
+            stats.inserted_count += inserted
+            stats.changed_count += changed
+            stats.unchanged_count += unchanged
+            stats.skipped_new_history_count += skipped_new_history
+            stats.hash_match_count += hash_match
+            stats.hash_miss_count += hash_miss
+            stats.hash_changed_count += hash_changed
+            stats.hash_upsert_count += hash_upsert
+            stats.hash_backfill_count += hash_backfill
 
     @staticmethod
     def _coerce_existing_doc(
@@ -452,6 +728,7 @@ class AsyncFareBatchProcessor:
                 f"hash_changed={stats.hash_changed_count:,} "
                 f"hash_miss={stats.hash_miss_count:,} "
                 f"hash_upsert={stats.hash_upsert_count:,} "
+                f"hash_backfill={stats.hash_backfill_count:,} "
                 f"assigned_rps={stats.records_per_second} "
                 f"scan_rps={stats.scanned_records_per_second}"
             ),
