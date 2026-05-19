@@ -1,48 +1,127 @@
 from __future__ import annotations
 
 import argparse
-import sys
-
-from dotenv import load_dotenv
+import asyncio
 
 from .config import CouchbaseConfig
-from .processor import FareBatchProcessor, print_json
+from .couchbase_client import AsyncCouchbaseFareRepository
+from .processor import AsyncFareBatchProcessor, print_json
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Process fare CSV into Couchbase current/history collections.")
-    parser.add_argument("--csv", required=True, help="Path to the fare CSV file.")
-    parser.add_argument("--batch-id", required=True, help="Deterministic batch id, e.g. batch::2026-05-18T15.")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and preview documents without connecting to Couchbase.")
-    parser.add_argument("--preview", type=int, default=0, help="Number of rows to print in dry-run mode.")
-    parser.add_argument("--env-file", default=None, help="Optional .env file path.")
-    return parser.parse_args(argv)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Process airline fare CSV batches into Couchbase."
+    )
+
+    parser.add_argument(
+        "--csv",
+        required=True,
+        help="Path to the CSV file to process.",
+    )
+
+    parser.add_argument(
+        "--batch-id",
+        required=True,
+        help="Unique batch id, for example batch::10m-base.",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse and build documents without writing to Couchbase.",
+    )
+
+    parser.add_argument(
+        "--preview",
+        type=int,
+        default=0,
+        help="In dry-run mode, print the first N generated docs.",
+    )
+
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1000,
+        help="Maximum number of in-flight row processing tasks.",
+    )
+
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10000,
+        help="Print progress every N received rows.",
+    )
+
+    parser.add_argument(
+        "--batch-control-every",
+        type=int,
+        default=100000,
+        help="Update batch_control every N received rows.",
+    )
+
+    parser.add_argument(
+        "--skip-new-history",
+        action="store_true",
+        help=(
+            "Do not write NEW_FARE history events for initial loads. "
+            "This greatly speeds up baseline seeding."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-cas-retries",
+        type=int,
+        default=3,
+        help="Maximum CAS retry attempts for concurrent updates.",
+    )
+
+    return parser.parse_args()
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
-
-    if args.env_file:
-        load_dotenv(args.env_file)
-    else:
-        load_dotenv()
+async def async_main() -> int:
+    args = parse_args()
 
     repo = None
+
     try:
         if not args.dry_run:
-            from .couchbase_client import CouchbaseFareRepository
-
             config = CouchbaseConfig.from_env()
-            repo = CouchbaseFareRepository(config)
+            repo = AsyncCouchbaseFareRepository(config)
+            await repo.connect()
 
-        processor = FareBatchProcessor(repository=repo, dry_run=args.dry_run, preview=args.preview)
-        stats = processor.process_csv(csv_path=args.csv, batch_id=args.batch_id)
+        processor = AsyncFareBatchProcessor(
+            repository=repo,
+            dry_run=args.dry_run,
+            preview=args.preview,
+            concurrency=args.concurrency,
+            progress_every=args.progress_every,
+            batch_control_every=args.batch_control_every,
+            max_cas_retries=args.max_cas_retries,
+            skip_new_history=args.skip_new_history,
+        )
+
+        stats = await processor.process_csv(
+            csv_path=args.csv,
+            batch_id=args.batch_id,
+        )
+
         print("\n=== BATCH STATS ===")
-        print_json({"type": "fare_batch", **stats.__dict__})
+        print_json(
+            {
+                "type": "fare_batch",
+                **stats.__dict__,
+            }
+        )
+
         return 0
+
     finally:
         if repo is not None:
-            repo.close()
+            await repo.close()
+
+
+def main() -> int:
+    return asyncio.run(async_main())
 
 
 if __name__ == "__main__":

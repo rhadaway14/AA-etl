@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 import os
+
+from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,8 @@ class CouchbaseConfig:
 
     @staticmethod
     def from_env() -> "CouchbaseConfig":
+        load_dotenv()
+
         required = [
             "COUCHBASE_CONNSTR",
             "COUCHBASE_USERNAME",

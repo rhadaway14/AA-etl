@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ class BatchStats:
     batch_id: str
     source_file: str
     status: str = "PROCESSING"
+
     received_count: int = 0
     processed_count: int = 0
     inserted_count: int = 0
@@ -30,29 +32,41 @@ class BatchStats:
     failed_count: int = 0
     cas_retry_count: int = 0
     history_duplicate_count: int = 0
+    skipped_new_history_count: int = 0
+
     started_at: str = ""
     completed_at: str | None = None
 
-    # Runtime metrics
     duration_seconds: float | None = None
     duration_ms: int | None = None
     records_per_second: float | None = None
 
 
-class FareBatchProcessor:
+class AsyncFareBatchProcessor:
     def __init__(
         self,
-        repository: Any | None,
+        repository: Any,
+        *,
         dry_run: bool = False,
         preview: int = 0,
+        concurrency: int = 1000,
+        progress_every: int = 10000,
+        batch_control_every: int = 100000,
         max_cas_retries: int = 3,
+        skip_new_history: bool = False,
     ):
         self.repository = repository
         self.dry_run = dry_run
         self.preview = preview
+        self.concurrency = concurrency
+        self.progress_every = progress_every
+        self.batch_control_every = batch_control_every
         self.max_cas_retries = max_cas_retries
+        self.skip_new_history = skip_new_history
 
-    def process_csv(self, csv_path: str, batch_id: str) -> BatchStats:
+        self._stats_lock = asyncio.Lock()
+
+    async def process_csv(self, csv_path: str, batch_id: str) -> BatchStats:
         source_file = Path(csv_path).name
         started_perf = time.perf_counter()
 
@@ -62,80 +76,230 @@ class FareBatchProcessor:
             started_at=utc_now_iso(),
         )
 
-        self._write_batch_control(stats)
+        await self._write_batch_control(stats)
+
+        pending: set[asyncio.Task] = set()
 
         for row_number, row in iter_csv_rows(csv_path):
-            stats.received_count += 1
+            async with self._stats_lock:
+                stats.received_count += 1
+                received = stats.received_count
 
-            try:
-                self._process_row(
+            task = asyncio.create_task(
+                self._process_row_safely(
                     row=row,
                     row_number=row_number,
                     source_file=source_file,
                     batch_id=batch_id,
                     stats=stats,
                 )
-                stats.processed_count += 1
+            )
 
-            except Exception as exc:
-                stats.failed_count += 1
+            pending.add(task)
 
-                print("")
-                print("=" * 80, flush=True)
-                print(f"[error] Failed processing row {row_number}", flush=True)
-                print(f"[error] {type(exc).__name__}: {exc}", flush=True)
-                print(traceback.format_exc(limit=8), flush=True)
-                print("=" * 80, flush=True)
-                print("")
-
-                self._write_deadletter(
-                    batch_id=batch_id,
-                    source_file=source_file,
-                    row_number=row_number,
-                    row=row,
-                    error=str(exc),
-                    traceback_text=traceback.format_exc(limit=8),
+            if len(pending) >= self.concurrency:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
 
-            # Cheap checkpointing. For 10M rows, you may want this at 10k or 100k.
-            if stats.received_count % 1000 == 0:
+                for done_task in done:
+                    await done_task
+
+            if received % self.progress_every == 0:
+                await self._print_progress(stats, started_perf)
+
+            if received % self.batch_control_every == 0:
                 self._update_runtime_metrics(stats, started_perf)
-                self._write_batch_control(stats)
+                await self._write_batch_control(stats)
+
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            for done_task in done:
+                await done_task
 
         stats.status = "COMPLETED" if stats.failed_count == 0 else "COMPLETED_WITH_ERRORS"
         stats.completed_at = utc_now_iso()
         self._update_runtime_metrics(stats, started_perf)
 
-        self._write_batch_control(stats)
+        await self._write_batch_control(stats)
+        await self._print_progress(stats, started_perf, final=True)
 
         return stats
 
-    def _update_runtime_metrics(self, stats: BatchStats, started_perf: float) -> None:
-        duration_seconds = time.perf_counter() - started_perf
-        stats.duration_seconds = round(duration_seconds, 3)
-        stats.duration_ms = int(duration_seconds * 1000)
-
-        if duration_seconds > 0:
-            stats.records_per_second = round(stats.received_count / duration_seconds, 2)
-        else:
-            stats.records_per_second = None
-
-    def _coerce_existing_doc(
+    async def _process_row_safely(
         self,
+        *,
+        row: dict[str, Any],
+        row_number: int,
+        source_file: str,
+        batch_id: str,
+        stats: BatchStats,
+    ) -> None:
+        try:
+            result = await self._process_row(
+                row=row,
+                row_number=row_number,
+                source_file=source_file,
+                batch_id=batch_id,
+            )
+
+            async with self._stats_lock:
+                stats.processed_count += 1
+
+                if result == "inserted":
+                    stats.inserted_count += 1
+                elif result == "changed":
+                    stats.changed_count += 1
+                elif result == "unchanged":
+                    stats.unchanged_count += 1
+                elif result == "history_duplicate":
+                    stats.history_duplicate_count += 1
+                elif result == "skipped_new_history":
+                    stats.inserted_count += 1
+                    stats.skipped_new_history_count += 1
+                elif result == "cas_retry":
+                    stats.cas_retry_count += 1
+
+        except Exception as exc:
+            async with self._stats_lock:
+                stats.failed_count += 1
+
+            print("")
+            print("=" * 80, flush=True)
+            print(f"[error] Failed processing row {row_number}", flush=True)
+            print(f"[error] {type(exc).__name__}: {exc}", flush=True)
+            print(traceback.format_exc(limit=8), flush=True)
+            print("=" * 80, flush=True)
+            print("")
+
+            await self._write_deadletter(
+                batch_id=batch_id,
+                source_file=source_file,
+                row_number=row_number,
+                row=row,
+                error=str(exc),
+                traceback_text=traceback.format_exc(limit=8),
+            )
+
+    async def _process_row(
+        self,
+        *,
+        row: dict[str, Any],
+        row_number: int,
+        source_file: str,
+        batch_id: str,
+    ) -> str:
+        now = utc_now_iso()
+
+        parts = row_to_parts(
+            row=row,
+            batch_id=batch_id,
+            source_file=source_file,
+            row_number=row_number,
+        )
+
+        new_doc = build_current_document(parts=parts, now=now)
+
+        if self.dry_run:
+            if row_number <= self.preview:
+                history_doc = build_history_document(
+                    parts=parts,
+                    change_type="NEW_FARE",
+                    old_doc=None,
+                    new_doc=new_doc,
+                    batch_id=batch_id,
+                    now=now,
+                )
+
+                print("\n--- DRY RUN CURRENT DOC ---")
+                print_json(new_doc)
+
+                print("\n--- DRY RUN HISTORY DOC ---")
+                print_json(history_doc)
+
+            return "inserted"
+
+        for _attempt in range(self.max_cas_retries + 1):
+            existing = await self.repository.get_current(parts.fare_key)
+
+            if existing is None:
+                if not self.skip_new_history:
+                    history_doc = build_history_document(
+                        parts=parts,
+                        change_type="NEW_FARE",
+                        old_doc=None,
+                        new_doc=new_doc,
+                        batch_id=batch_id,
+                        now=now,
+                    )
+
+                    inserted_history = await self.repository.insert_history(
+                        history_key(parts, batch_id),
+                        history_doc,
+                    )
+
+                    if not inserted_history:
+                        return "history_duplicate"
+
+                inserted_current = await self.repository.insert_current(
+                    parts.fare_key,
+                    new_doc,
+                )
+
+                if inserted_current:
+                    if self.skip_new_history:
+                        return "skipped_new_history"
+                    return "inserted"
+
+                # Race: someone else inserted the doc after our GET.
+                continue
+
+            old_doc, cas = self._coerce_existing_doc(existing)
+            old_hash = old_doc.get("business_hash")
+
+            if old_hash == parts.business_hash:
+                return "unchanged"
+
+            updated_doc = build_current_document(
+                parts=parts,
+                now=now,
+                existing_created_at=old_doc.get("created_at"),
+            )
+
+            history_doc = build_history_document(
+                parts=parts,
+                change_type="UPDATED_FARE",
+                old_doc=old_doc,
+                new_doc=updated_doc,
+                batch_id=batch_id,
+                now=now,
+            )
+
+            inserted_history = await self.repository.insert_history(
+                history_key(parts, batch_id),
+                history_doc,
+            )
+
+            if not inserted_history:
+                # Same batch/hash was already written. Continue trying to update current.
+                pass
+
+            replaced = await self.repository.replace_current(
+                parts.fare_key,
+                updated_doc,
+                cas=cas,
+            )
+
+            if replaced:
+                return "changed"
+
+        raise RuntimeError(f"CAS retries exceeded for {parts.fare_key}")
+
+    @staticmethod
+    def _coerce_existing_doc(
         current_result: Any,
     ) -> tuple[dict[str, Any], Any]:
-        """
-        Normalize whatever repository.get_current() returns.
-
-        Preferred repository return shape:
-            (document_dict, cas)
-
-        Also supports:
-            {"content": document_dict, "cas": cas}
-
-        And recovery case:
-            document content stored as JSON string.
-        """
         cas = None
 
         if isinstance(current_result, tuple) and len(current_result) == 2:
@@ -159,129 +323,41 @@ class FareBatchProcessor:
 
         return old_doc, cas
 
-    def _process_row(
-        self,
-        *,
-        row: dict[str, Any],
-        row_number: int,
-        source_file: str,
-        batch_id: str,
-        stats: BatchStats,
-    ) -> None:
-        now = utc_now_iso()
+    def _update_runtime_metrics(self, stats: BatchStats, started_perf: float) -> None:
+        duration_seconds = time.perf_counter() - started_perf
+        stats.duration_seconds = round(duration_seconds, 3)
+        stats.duration_ms = int(duration_seconds * 1000)
 
-        parts = row_to_parts(
-            row=row,
-            batch_id=batch_id,
-            source_file=source_file,
-            row_number=row_number,
+        if duration_seconds > 0:
+            stats.records_per_second = round(stats.received_count / duration_seconds, 2)
+        else:
+            stats.records_per_second = None
+
+    async def _print_progress(
+        self,
+        stats: BatchStats,
+        started_perf: float,
+        *,
+        final: bool = False,
+    ) -> None:
+        self._update_runtime_metrics(stats, started_perf)
+
+        label = "final" if final else "progress"
+
+        print(
+            (
+                f"[{label}] received={stats.received_count:,} "
+                f"processed={stats.processed_count:,} "
+                f"inserted={stats.inserted_count:,} "
+                f"changed={stats.changed_count:,} "
+                f"unchanged={stats.unchanged_count:,} "
+                f"failed={stats.failed_count:,} "
+                f"rps={stats.records_per_second}"
+            ),
+            flush=True,
         )
 
-        new_doc = build_current_document(parts=parts, now=now)
-
-        if self.dry_run:
-            stats.inserted_count += 1
-
-            if row_number <= self.preview:
-                history_doc = build_history_document(
-                    parts=parts,
-                    change_type="NEW_FARE",
-                    old_doc=None,
-                    new_doc=new_doc,
-                    batch_id=batch_id,
-                    now=now,
-                )
-
-                print("\n--- DRY RUN CURRENT DOC ---")
-                print_json(new_doc)
-
-                print("\n--- DRY RUN HISTORY DOC ---")
-                print_json(history_doc)
-
-            return
-
-        if self.repository is None:
-            raise RuntimeError("Repository is required when dry_run=False")
-
-        for _attempt in range(self.max_cas_retries + 1):
-            existing = self.repository.get_current(parts.fare_key)
-
-            if existing is None:
-                history_doc = build_history_document(
-                    parts=parts,
-                    change_type="NEW_FARE",
-                    old_doc=None,
-                    new_doc=new_doc,
-                    batch_id=batch_id,
-                    now=now,
-                )
-
-                inserted_history = self.repository.insert_history(
-                    history_key(parts, batch_id),
-                    history_doc,
-                )
-
-                if not inserted_history:
-                    stats.history_duplicate_count += 1
-
-                inserted_current = self.repository.insert_current(
-                    parts.fare_key,
-                    new_doc,
-                )
-
-                if inserted_current:
-                    stats.inserted_count += 1
-                    return
-
-                # Someone else inserted it first. Re-read and process as update/unchanged.
-                stats.cas_retry_count += 1
-                continue
-
-            old_doc, cas = self._coerce_existing_doc(existing)
-            old_hash = old_doc.get("business_hash")
-
-            if old_hash == parts.business_hash:
-                stats.unchanged_count += 1
-                return
-
-            updated_doc = build_current_document(
-                parts=parts,
-                now=now,
-                existing_created_at=old_doc.get("created_at"),
-            )
-
-            history_doc = build_history_document(
-                parts=parts,
-                change_type="UPDATED_FARE",
-                old_doc=old_doc,
-                new_doc=updated_doc,
-                batch_id=batch_id,
-                now=now,
-            )
-
-            inserted_history = self.repository.insert_history(
-                history_key(parts, batch_id),
-                history_doc,
-            )
-
-            if not inserted_history:
-                stats.history_duplicate_count += 1
-
-            replaced = self.repository.replace_current(
-                parts.fare_key,
-                updated_doc,
-                cas=cas,
-            )
-
-            if replaced:
-                stats.changed_count += 1
-                return
-
-            stats.cas_retry_count += 1
-
-        raise RuntimeError(f"CAS retries exceeded for {parts.fare_key}")
-
-    def _write_batch_control(self, stats: BatchStats) -> None:
+    async def _write_batch_control(self, stats: BatchStats) -> None:
         if self.dry_run or self.repository is None:
             return
 
@@ -290,9 +366,9 @@ class FareBatchProcessor:
             **asdict(stats),
         }
 
-        self.repository.upsert_batch(stats.batch_id, doc)
+        await self.repository.upsert_batch(stats.batch_id, doc)
 
-    def _write_deadletter(
+    async def _write_deadletter(
         self,
         *,
         batch_id: str,
@@ -318,7 +394,7 @@ class FareBatchProcessor:
             print_json(doc)
             return
 
-        self.repository.insert_deadletter(
+        await self.repository.insert_deadletter(
             f"deadletter::{batch_id}::{row_number}",
             doc,
         )
@@ -335,6 +411,4 @@ def print_json(value: Any) -> None:
             ).decode("utf-8")
         )
     except Exception:
-        import json
-
         print(json.dumps(value, indent=2, sort_keys=True, default=str))
