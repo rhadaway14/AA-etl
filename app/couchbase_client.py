@@ -12,7 +12,7 @@ from couchbase.exceptions import (
     DocumentExistsException,
     DocumentNotFoundException,
     RequestCanceledException,
-    TemporaryFailureException,
+    TemporaryFailException,
     UnAmbiguousTimeoutException,
 )
 from couchbase.options import ClusterOptions, ReplaceOptions
@@ -23,7 +23,7 @@ from .config import CouchbaseConfig
 TRANSIENT_EXCEPTIONS = (
     AmbiguousTimeoutException,
     UnAmbiguousTimeoutException,
-    TemporaryFailureException,
+    TemporaryFailException,
     RequestCanceledException,
 )
 
