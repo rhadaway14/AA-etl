@@ -42,21 +42,21 @@ def parse_args() -> argparse.Namespace:
         "--concurrency",
         type=int,
         default=1000,
-        help="Maximum number of in-flight row processing tasks.",
+        help="Maximum number of in-flight row processing tasks per worker.",
     )
 
     parser.add_argument(
         "--progress-every",
         type=int,
         default=10000,
-        help="Print progress every N received rows.",
+        help="Print progress every N scanned rows.",
     )
 
     parser.add_argument(
         "--batch-control-every",
         type=int,
         default=100000,
-        help="Update batch_control every N received rows.",
+        help="Update batch_control every N scanned rows.",
     )
 
     parser.add_argument(
@@ -84,11 +84,31 @@ def parse_args() -> argparse.Namespace:
         help="Maximum CAS retry attempts for concurrent updates.",
     )
 
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=1,
+        help="Total number of parallel workers.",
+    )
+
+    parser.add_argument(
+        "--worker-id",
+        type=int,
+        default=0,
+        help="This worker's zero-based worker id.",
+    )
+
     return parser.parse_args()
 
 
 async def async_main() -> int:
     args = parse_args()
+
+    if args.worker_count < 1:
+        raise ValueError("--worker-count must be >= 1")
+
+    if args.worker_id < 0 or args.worker_id >= args.worker_count:
+        raise ValueError("--worker-id must be between 0 and worker-count - 1")
 
     repo = None
 
@@ -97,6 +117,11 @@ async def async_main() -> int:
             config = CouchbaseConfig.from_env()
             repo = AsyncCouchbaseFareRepository(config)
             await repo.connect()
+
+        worker_batch_id = args.batch_id
+
+        if args.worker_count > 1:
+            worker_batch_id = f"{args.batch_id}::worker-{args.worker_id:03d}-of-{args.worker_count:03d}"
 
         processor = AsyncFareBatchProcessor(
             repository=repo,
@@ -108,11 +133,14 @@ async def async_main() -> int:
             max_cas_retries=args.max_cas_retries,
             skip_new_history=args.skip_new_history,
             initial_load=args.initial_load,
+            worker_count=args.worker_count,
+            worker_id=args.worker_id,
+            parent_batch_id=args.batch_id,
         )
 
         stats = await processor.process_csv(
             csv_path=args.csv,
-            batch_id=args.batch_id,
+            batch_id=worker_batch_id,
         )
 
         print("\n=== BATCH STATS ===")

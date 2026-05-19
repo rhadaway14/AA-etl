@@ -7,6 +7,7 @@ from typing import Any
 import json
 import time
 import traceback
+import zlib
 
 from .csv_reader import iter_csv_rows
 from .fare_model import (
@@ -24,6 +25,13 @@ class BatchStats:
     source_file: str
     status: str = "PROCESSING"
 
+    parent_batch_id: str | None = None
+    worker_count: int = 1
+    worker_id: int = 0
+
+    scanned_count: int = 0
+    skipped_by_worker_count: int = 0
+
     received_count: int = 0
     processed_count: int = 0
     inserted_count: int = 0
@@ -40,6 +48,7 @@ class BatchStats:
     duration_seconds: float | None = None
     duration_ms: int | None = None
     records_per_second: float | None = None
+    scanned_records_per_second: float | None = None
     completed_count: int = 0
     in_flight_count: int = 0
 
@@ -57,6 +66,9 @@ class AsyncFareBatchProcessor:
         max_cas_retries: int = 3,
         skip_new_history: bool = False,
         initial_load: bool = False,
+        worker_count: int = 1,
+        worker_id: int = 0,
+        parent_batch_id: str | None = None,
     ):
         self.repository = repository
         self.dry_run = dry_run
@@ -67,6 +79,9 @@ class AsyncFareBatchProcessor:
         self.max_cas_retries = max_cas_retries
         self.skip_new_history = skip_new_history
         self.initial_load = initial_load
+        self.worker_count = worker_count
+        self.worker_id = worker_id
+        self.parent_batch_id = parent_batch_id
 
         self._stats_lock = asyncio.Lock()
 
@@ -77,6 +92,9 @@ class AsyncFareBatchProcessor:
         stats = BatchStats(
             batch_id=batch_id,
             source_file=source_file,
+            parent_batch_id=self.parent_batch_id,
+            worker_count=self.worker_count,
+            worker_id=self.worker_id,
             started_at=utc_now_iso(),
         )
 
@@ -86,8 +104,16 @@ class AsyncFareBatchProcessor:
 
         for row_number, row in iter_csv_rows(csv_path):
             async with self._stats_lock:
+                stats.scanned_count += 1
+                scanned = stats.scanned_count
+
+            if not self._row_belongs_to_worker(row):
+                async with self._stats_lock:
+                    stats.skipped_by_worker_count += 1
+                continue
+
+            async with self._stats_lock:
                 stats.received_count += 1
-                received = stats.received_count
 
             task = asyncio.create_task(
                 self._process_row_safely(
@@ -110,10 +136,10 @@ class AsyncFareBatchProcessor:
                 for done_task in done:
                     await done_task
 
-            if received % self.progress_every == 0:
+            if scanned % self.progress_every == 0:
                 await self._print_progress(stats, started_perf)
 
-            if received % self.batch_control_every == 0:
+            if scanned % self.batch_control_every == 0:
                 self._update_runtime_metrics(stats, started_perf)
                 await self._write_batch_control(stats)
 
@@ -130,6 +156,20 @@ class AsyncFareBatchProcessor:
         await self._print_progress(stats, started_perf, final=True)
 
         return stats
+
+    def _row_belongs_to_worker(self, row: dict[str, Any]) -> bool:
+        if self.worker_count <= 1:
+            return True
+
+        key = row.get("key_column")
+
+        if not key:
+            # Let the owning code validate and dead-letter it.
+            # Assign bad/missing keys to worker 0 to avoid duplicate dead letters.
+            return self.worker_id == 0
+
+        partition = zlib.crc32(str(key).encode("utf-8")) % self.worker_count
+        return partition == self.worker_id
 
     async def _process_row_safely(
         self,
@@ -220,8 +260,8 @@ class AsyncFareBatchProcessor:
 
             return "inserted"
 
-        # Fast path for initial baseline seeding.
-        # No GET, no comparison, no NEW_FARE history.
+        # Fast baseline path:
+        # no GET, no compare, no NEW_FARE history.
         if self.initial_load:
             await self.repository.upsert_current(parts.fare_key, new_doc)
             return "skipped_new_history"
@@ -240,15 +280,10 @@ class AsyncFareBatchProcessor:
                         now=now,
                     )
 
-                    inserted_history = await self.repository.insert_history(
+                    await self.repository.insert_history(
                         history_key(parts, batch_id),
                         history_doc,
                     )
-
-                    if not inserted_history:
-                        # Duplicate history means this batch/hash was already written.
-                        # Continue to current insert path for idempotency.
-                        pass
 
                 inserted_current = await self.repository.insert_current(
                     parts.fare_key,
@@ -260,8 +295,6 @@ class AsyncFareBatchProcessor:
                         return "skipped_new_history"
                     return "inserted"
 
-                # Race or ambiguous timeout recovery: doc already exists now.
-                # Re-read and process as unchanged/update.
                 continue
 
             old_doc, cas = self._coerce_existing_doc(existing)
@@ -298,11 +331,6 @@ class AsyncFareBatchProcessor:
 
             if replaced:
                 return "changed"
-
-            async with self._stats_lock:
-                # CAS mismatch due to concurrent update.
-                # Loop and try again.
-                pass
 
         raise RuntimeError(f"CAS retries exceeded for {parts.fare_key}")
 
@@ -343,8 +371,13 @@ class AsyncFareBatchProcessor:
 
         if duration_seconds > 0:
             stats.records_per_second = round(stats.received_count / duration_seconds, 2)
+            stats.scanned_records_per_second = round(
+                stats.scanned_count / duration_seconds,
+                2,
+            )
         else:
             stats.records_per_second = None
+            stats.scanned_records_per_second = None
 
     async def _print_progress(
         self,
@@ -360,14 +393,17 @@ class AsyncFareBatchProcessor:
         print(
             (
                 f"[{label}] "
-                f"received={stats.received_count:,} "
+                f"worker={stats.worker_id}/{stats.worker_count} "
+                f"scanned={stats.scanned_count:,} "
+                f"assigned={stats.received_count:,} "
                 f"completed={stats.completed_count:,} "
                 f"in_flight={stats.in_flight_count:,} "
                 f"inserted={stats.inserted_count:,} "
                 f"changed={stats.changed_count:,} "
                 f"unchanged={stats.unchanged_count:,} "
                 f"failed={stats.failed_count:,} "
-                f"rps={stats.records_per_second}"
+                f"assigned_rps={stats.records_per_second} "
+                f"scan_rps={stats.scanned_records_per_second}"
             ),
             flush=True,
         )
