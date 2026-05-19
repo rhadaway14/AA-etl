@@ -1,2 +1,6 @@
-T0StreamingDirectly_10M_base.csv
-T0StreamingDirectly_10M_100k_changes.csv
+# Large generated fare test files
+sample-data/T0StreamingDirectly_10M_base.csv
+sample-data/T0StreamingDirectly_10M_100k_changes.csv
+
+# Or ignore all generated 10M fare CSVs
+sample-data/*10M*.csv
