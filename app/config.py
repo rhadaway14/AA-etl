@@ -17,6 +17,7 @@ class CouchbaseConfig:
     current_collection: str = "current_fares"
     batch_collection: str = "batch_control"
     deadletter_collection: str = "dead_letter"
+    hash_collection: str = "fare_hashes"
 
     history_bucket: str = "fare_history"
     history_scope: str = "airline"
@@ -60,6 +61,10 @@ class CouchbaseConfig:
             deadletter_collection=os.getenv(
                 "COUCHBASE_DEADLETTER_COLLECTION",
                 "dead_letter",
+            ),
+            hash_collection=os.getenv(
+                "COUCHBASE_HASH_COLLECTION",
+                "fare_hashes",
             ),
 
             history_bucket=os.getenv("COUCHBASE_HISTORY_BUCKET", "fare_history"),

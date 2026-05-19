@@ -41,6 +41,10 @@ class BatchStats:
     cas_retry_count: int = 0
     history_duplicate_count: int = 0
     skipped_new_history_count: int = 0
+    hash_match_count: int = 0
+    hash_miss_count: int = 0
+    hash_changed_count: int = 0
+    hash_upsert_count: int = 0
 
     started_at: str = ""
     completed_at: str | None = None
@@ -164,12 +168,14 @@ class AsyncFareBatchProcessor:
         key = row.get("key_column")
 
         if not key:
-            # Let the owning code validate and dead-letter it.
-            # Assign bad/missing keys to worker 0 to avoid duplicate dead letters.
             return self.worker_id == 0
 
         partition = zlib.crc32(str(key).encode("utf-8")) % self.worker_count
         return partition == self.worker_id
+
+    @staticmethod
+    def _hash_key_for_fare_key(fare_key: str) -> str:
+        return f"hash::{fare_key}"
 
     async def _process_row_safely(
         self,
@@ -186,6 +192,7 @@ class AsyncFareBatchProcessor:
                 row_number=row_number,
                 source_file=source_file,
                 batch_id=batch_id,
+                stats=stats,
             )
 
             async with self._stats_lock:
@@ -229,6 +236,7 @@ class AsyncFareBatchProcessor:
         row_number: int,
         source_file: str,
         batch_id: str,
+        stats: BatchStats,
     ) -> str:
         now = utc_now_iso()
 
@@ -240,6 +248,16 @@ class AsyncFareBatchProcessor:
         )
 
         new_doc = build_current_document(parts=parts, now=now)
+        hash_key = self._hash_key_for_fare_key(parts.fare_key)
+
+        hash_doc = {
+            "type": "fare_hash",
+            "fare_key": parts.fare_key,
+            "source_key": parts.source_key,
+            "business_hash": parts.business_hash,
+            "last_batch_id": batch_id,
+            "updated_at": now,
+        }
 
         if self.dry_run:
             if row_number <= self.preview:
@@ -255,6 +273,9 @@ class AsyncFareBatchProcessor:
                 print("\n--- DRY RUN CURRENT DOC ---")
                 print_json(new_doc)
 
+                print("\n--- DRY RUN HASH DOC ---")
+                print_json(hash_doc)
+
                 print("\n--- DRY RUN HISTORY DOC ---")
                 print_json(history_doc)
 
@@ -262,9 +283,31 @@ class AsyncFareBatchProcessor:
 
         # Fast baseline path:
         # no GET, no compare, no NEW_FARE history.
+        # But we do upsert the hash collection.
         if self.initial_load:
             await self.repository.upsert_current(parts.fare_key, new_doc)
+            await self.repository.upsert_hash(hash_key, hash_doc)
+
+            async with self._stats_lock:
+                stats.hash_upsert_count += 1
+
             return "skipped_new_history"
+
+        existing_hash_doc = await self.repository.get_hash(hash_key)
+
+        if existing_hash_doc is not None:
+            existing_hash = existing_hash_doc.get("business_hash")
+
+            if existing_hash == parts.business_hash:
+                async with self._stats_lock:
+                    stats.hash_match_count += 1
+                return "unchanged"
+
+            async with self._stats_lock:
+                stats.hash_changed_count += 1
+        else:
+            async with self._stats_lock:
+                stats.hash_miss_count += 1
 
         for _attempt in range(self.max_cas_retries + 1):
             existing = await self.repository.get_current(parts.fare_key)
@@ -291,6 +334,10 @@ class AsyncFareBatchProcessor:
                 )
 
                 if inserted_current:
+                    await self.repository.upsert_hash(hash_key, hash_doc)
+                    async with self._stats_lock:
+                        stats.hash_upsert_count += 1
+
                     if self.skip_new_history:
                         return "skipped_new_history"
                     return "inserted"
@@ -301,6 +348,10 @@ class AsyncFareBatchProcessor:
             old_hash = old_doc.get("business_hash")
 
             if old_hash == parts.business_hash:
+                # Hash collection was missing/stale. Repair it.
+                await self.repository.upsert_hash(hash_key, hash_doc)
+                async with self._stats_lock:
+                    stats.hash_upsert_count += 1
                 return "unchanged"
 
             updated_doc = build_current_document(
@@ -330,6 +381,9 @@ class AsyncFareBatchProcessor:
             )
 
             if replaced:
+                await self.repository.upsert_hash(hash_key, hash_doc)
+                async with self._stats_lock:
+                    stats.hash_upsert_count += 1
                 return "changed"
 
         raise RuntimeError(f"CAS retries exceeded for {parts.fare_key}")
@@ -402,6 +456,10 @@ class AsyncFareBatchProcessor:
                 f"changed={stats.changed_count:,} "
                 f"unchanged={stats.unchanged_count:,} "
                 f"failed={stats.failed_count:,} "
+                f"hash_match={stats.hash_match_count:,} "
+                f"hash_changed={stats.hash_changed_count:,} "
+                f"hash_miss={stats.hash_miss_count:,} "
+                f"hash_upsert={stats.hash_upsert_count:,} "
                 f"assigned_rps={stats.records_per_second} "
                 f"scan_rps={stats.scanned_records_per_second}"
             ),

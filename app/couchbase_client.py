@@ -20,8 +20,6 @@ from couchbase.options import ClusterOptions, ReplaceOptions
 from .config import CouchbaseConfig
 
 
-# Couchbase Python SDK versions differ slightly in exception names.
-# Your SDK uses TemporaryFailException, not TemporaryFailureException.
 try:
     from couchbase.exceptions import TemporaryFailException
 except ImportError:  # pragma: no cover
@@ -45,16 +43,6 @@ TRANSIENT_EXCEPTIONS = _build_transient_exceptions()
 
 
 class AsyncCouchbaseFareRepository:
-    """
-    Async Couchbase repository for high-throughput fare ingestion.
-
-    Important behavior:
-    - Uses async KV operations.
-    - Retries transient KV errors.
-    - Handles ambiguous insert timeouts by treating DocumentExistsException
-      during retry as a non-fatal idempotency outcome.
-    """
-
     def __init__(self, config: CouchbaseConfig):
         self.config = config
         self.cluster: Cluster | None = None
@@ -62,6 +50,7 @@ class AsyncCouchbaseFareRepository:
         self.current = None
         self.batch = None
         self.deadletter = None
+        self.hashes = None
         self.history = None
 
         self.max_retries = 5
@@ -94,6 +83,9 @@ class AsyncCouchbaseFareRepository:
         print(f"[couchbase] opening collection {self.config.deadletter_collection}", flush=True)
         self.deadletter = fares_scope.collection(self.config.deadletter_collection)
 
+        print(f"[couchbase] opening collection {self.config.hash_collection}", flush=True)
+        self.hashes = fares_scope.collection(self.config.hash_collection)
+
         print(f"[couchbase] opening history bucket {self.config.history_bucket}", flush=True)
         history_bucket = self.cluster.bucket(self.config.history_bucket)
         await history_bucket.on_connect()
@@ -113,6 +105,7 @@ class AsyncCouchbaseFareRepository:
             ("current_fares", self.current),
             ("batch_control", self.batch),
             ("dead_letter", self.deadletter),
+            ("fare_hashes", self.hashes),
             ("fare_changes_7d", self.history),
         ]
 
@@ -144,13 +137,10 @@ class AsyncCouchbaseFareRepository:
                     self.base_backoff_seconds * (2 ** attempt),
                     self.max_backoff_seconds,
                 )
-
-                # Small jitter prevents many concurrent tasks from retrying together.
                 jitter = min(0.025 * attempt, 0.1)
                 await asyncio.sleep(backoff + jitter)
 
             except CouchbaseException:
-                # Non-transient SDK exception. Let caller decide.
                 raise
 
         if last_exc is not None:
@@ -160,15 +150,6 @@ class AsyncCouchbaseFareRepository:
 
     @staticmethod
     def content_as_dict(result: Any) -> dict[str, Any]:
-        """
-        Decode Couchbase result content into a dict.
-
-        Normal case:
-            result.content_as[dict]
-
-        Recovery case:
-            an earlier version accidentally stored JSON as a string.
-        """
         try:
             content = result.content_as[dict]
         except Exception:
@@ -207,10 +188,7 @@ class AsyncCouchbaseFareRepository:
         try:
             await self._retry("insert_current", op)
             return True
-
         except DocumentExistsException:
-            # Important for ambiguous timeout recovery.
-            # The first insert may have succeeded, then retry sees it exists.
             return False
 
     async def upsert_current(self, key: str, doc: dict[str, Any]) -> bool:
@@ -230,6 +208,22 @@ class AsyncCouchbaseFareRepository:
         except CasMismatchException:
             return False
 
+    async def get_hash(self, key: str) -> dict[str, Any] | None:
+        async def op():
+            return await self.hashes.get(key)
+
+        try:
+            result = await self._retry("get_hash", op)
+            return self.content_as_dict(result)
+        except DocumentNotFoundException:
+            return None
+
+    async def upsert_hash(self, key: str, doc: dict[str, Any]) -> None:
+        async def op():
+            return await self.hashes.upsert(key, doc)
+
+        await self._retry("upsert_hash", op)
+
     async def insert_history(self, key: str, doc: dict[str, Any]) -> bool:
         async def op():
             return await self.history.insert(key, doc)
@@ -237,9 +231,7 @@ class AsyncCouchbaseFareRepository:
         try:
             await self._retry("insert_history", op)
             return True
-
         except DocumentExistsException:
-            # Idempotent retry of same history event.
             return False
 
     async def upsert_batch(self, key: str, doc: dict[str, Any]) -> None:
