@@ -63,8 +63,17 @@ def parse_args() -> argparse.Namespace:
         "--skip-new-history",
         action="store_true",
         help=(
-            "Do not write NEW_FARE history events for initial loads. "
-            "This greatly speeds up baseline seeding."
+            "Do not write NEW_FARE history events for new rows. "
+            "Useful for faster baseline seeding."
+        ),
+    )
+
+    parser.add_argument(
+        "--initial-load",
+        action="store_true",
+        help=(
+            "Fast baseline mode. Upserts current documents without reading existing "
+            "documents and without writing NEW_FARE history."
         ),
     )
 
@@ -98,6 +107,7 @@ async def async_main() -> int:
             batch_control_every=args.batch_control_every,
             max_cas_retries=args.max_cas_retries,
             skip_new_history=args.skip_new_history,
+            initial_load=args.initial_load,
         )
 
         stats = await processor.process_csv(

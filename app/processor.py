@@ -40,6 +40,8 @@ class BatchStats:
     duration_seconds: float | None = None
     duration_ms: int | None = None
     records_per_second: float | None = None
+    completed_count: int = 0
+    in_flight_count: int = 0
 
 
 class AsyncFareBatchProcessor:
@@ -54,6 +56,7 @@ class AsyncFareBatchProcessor:
         batch_control_every: int = 100000,
         max_cas_retries: int = 3,
         skip_new_history: bool = False,
+        initial_load: bool = False,
     ):
         self.repository = repository
         self.dry_run = dry_run
@@ -63,6 +66,7 @@ class AsyncFareBatchProcessor:
         self.batch_control_every = batch_control_every
         self.max_cas_retries = max_cas_retries
         self.skip_new_history = skip_new_history
+        self.initial_load = initial_load
 
         self._stats_lock = asyncio.Lock()
 
@@ -153,13 +157,9 @@ class AsyncFareBatchProcessor:
                     stats.changed_count += 1
                 elif result == "unchanged":
                     stats.unchanged_count += 1
-                elif result == "history_duplicate":
-                    stats.history_duplicate_count += 1
                 elif result == "skipped_new_history":
                     stats.inserted_count += 1
                     stats.skipped_new_history_count += 1
-                elif result == "cas_retry":
-                    stats.cas_retry_count += 1
 
         except Exception as exc:
             async with self._stats_lock:
@@ -220,6 +220,12 @@ class AsyncFareBatchProcessor:
 
             return "inserted"
 
+        # Fast path for initial baseline seeding.
+        # No GET, no comparison, no NEW_FARE history.
+        if self.initial_load:
+            await self.repository.upsert_current(parts.fare_key, new_doc)
+            return "skipped_new_history"
+
         for _attempt in range(self.max_cas_retries + 1):
             existing = await self.repository.get_current(parts.fare_key)
 
@@ -240,7 +246,9 @@ class AsyncFareBatchProcessor:
                     )
 
                     if not inserted_history:
-                        return "history_duplicate"
+                        # Duplicate history means this batch/hash was already written.
+                        # Continue to current insert path for idempotency.
+                        pass
 
                 inserted_current = await self.repository.insert_current(
                     parts.fare_key,
@@ -252,7 +260,8 @@ class AsyncFareBatchProcessor:
                         return "skipped_new_history"
                     return "inserted"
 
-                # Race: someone else inserted the doc after our GET.
+                # Race or ambiguous timeout recovery: doc already exists now.
+                # Re-read and process as unchanged/update.
                 continue
 
             old_doc, cas = self._coerce_existing_doc(existing)
@@ -276,14 +285,10 @@ class AsyncFareBatchProcessor:
                 now=now,
             )
 
-            inserted_history = await self.repository.insert_history(
+            await self.repository.insert_history(
                 history_key(parts, batch_id),
                 history_doc,
             )
-
-            if not inserted_history:
-                # Same batch/hash was already written. Continue trying to update current.
-                pass
 
             replaced = await self.repository.replace_current(
                 parts.fare_key,
@@ -293,6 +298,11 @@ class AsyncFareBatchProcessor:
 
             if replaced:
                 return "changed"
+
+            async with self._stats_lock:
+                # CAS mismatch due to concurrent update.
+                # Loop and try again.
+                pass
 
         raise RuntimeError(f"CAS retries exceeded for {parts.fare_key}")
 
@@ -328,6 +338,9 @@ class AsyncFareBatchProcessor:
         stats.duration_seconds = round(duration_seconds, 3)
         stats.duration_ms = int(duration_seconds * 1000)
 
+        stats.completed_count = stats.processed_count + stats.failed_count
+        stats.in_flight_count = max(stats.received_count - stats.completed_count, 0)
+
         if duration_seconds > 0:
             stats.records_per_second = round(stats.received_count / duration_seconds, 2)
         else:
@@ -346,8 +359,10 @@ class AsyncFareBatchProcessor:
 
         print(
             (
-                f"[{label}] received={stats.received_count:,} "
-                f"processed={stats.processed_count:,} "
+                f"[{label}] "
+                f"received={stats.received_count:,} "
+                f"completed={stats.completed_count:,} "
+                f"in_flight={stats.in_flight_count:,} "
                 f"inserted={stats.inserted_count:,} "
                 f"changed={stats.changed_count:,} "
                 f"unchanged={stats.unchanged_count:,} "
