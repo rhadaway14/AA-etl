@@ -47,7 +47,6 @@ class CouchbaseConfig:
             connstr=os.environ["COUCHBASE_CONNSTR"],
             username=os.environ["COUCHBASE_USERNAME"],
             password=os.environ["COUCHBASE_PASSWORD"],
-
             bucket=os.getenv("COUCHBASE_BUCKET", "fares"),
             scope=os.getenv("COUCHBASE_SCOPE", "airline"),
             current_collection=os.getenv(
@@ -66,14 +65,12 @@ class CouchbaseConfig:
                 "COUCHBASE_HASH_COLLECTION",
                 "fare_hashes",
             ),
-
             history_bucket=os.getenv("COUCHBASE_HISTORY_BUCKET", "fare_history"),
             history_scope=os.getenv("COUCHBASE_HISTORY_SCOPE", "airline"),
             history_collection=os.getenv(
                 "COUCHBASE_HISTORY_COLLECTION",
                 "fare_changes_7d",
             ),
-
             connect_timeout_seconds=int(
                 os.getenv("COUCHBASE_CONNECT_TIMEOUT_SECONDS", "20")
             ),

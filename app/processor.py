@@ -25,7 +25,6 @@ class BatchStats:
     source_file: str
     status: str = "PROCESSING"
 
-    parent_batch_id: str | None = None
     worker_count: int = 1
     worker_id: int = 0
 
@@ -72,7 +71,6 @@ class AsyncFareBatchProcessor:
         initial_load: bool = False,
         worker_count: int = 1,
         worker_id: int = 0,
-        parent_batch_id: str | None = None,
     ):
         self.repository = repository
         self.dry_run = dry_run
@@ -85,7 +83,6 @@ class AsyncFareBatchProcessor:
         self.initial_load = initial_load
         self.worker_count = worker_count
         self.worker_id = worker_id
-        self.parent_batch_id = parent_batch_id
 
         self._stats_lock = asyncio.Lock()
 
@@ -96,7 +93,6 @@ class AsyncFareBatchProcessor:
         stats = BatchStats(
             batch_id=batch_id,
             source_file=source_file,
-            parent_batch_id=self.parent_batch_id,
             worker_count=self.worker_count,
             worker_id=self.worker_id,
             started_at=utc_now_iso(),
@@ -281,9 +277,6 @@ class AsyncFareBatchProcessor:
 
             return "inserted"
 
-        # Fast baseline path:
-        # no GET, no compare, no NEW_FARE history.
-        # But we do upsert the hash collection.
         if self.initial_load:
             await self.repository.upsert_current(parts.fare_key, new_doc)
             await self.repository.upsert_hash(hash_key, hash_doc)
@@ -348,7 +341,6 @@ class AsyncFareBatchProcessor:
             old_hash = old_doc.get("business_hash")
 
             if old_hash == parts.business_hash:
-                # Hash collection was missing/stale. Repair it.
                 await self.repository.upsert_hash(hash_key, hash_doc)
                 async with self._stats_lock:
                     stats.hash_upsert_count += 1
@@ -470,12 +462,16 @@ class AsyncFareBatchProcessor:
         if self.dry_run or self.repository is None:
             return
 
-        doc = {
-            "type": "fare_batch",
+        worker_doc = {
             **asdict(stats),
         }
 
-        await self.repository.upsert_batch(stats.batch_id, doc)
+        await self.repository.upsert_batch_worker_stats(
+            batch_id=stats.batch_id,
+            worker_id=stats.worker_id,
+            worker_count=stats.worker_count,
+            worker_doc=worker_doc,
+        )
 
     async def _write_deadletter(
         self,
@@ -492,6 +488,8 @@ class AsyncFareBatchProcessor:
             "batch_id": batch_id,
             "source_file": source_file,
             "row_number": row_number,
+            "worker_id": self.worker_id,
+            "worker_count": self.worker_count,
             "error": error,
             "traceback": traceback_text,
             "raw_record": row,
@@ -504,7 +502,7 @@ class AsyncFareBatchProcessor:
             return
 
         await self.repository.insert_deadletter(
-            f"deadletter::{batch_id}::{row_number}",
+            f"deadletter::{batch_id}::worker-{self.worker_id}::{row_number}",
             doc,
         )
 

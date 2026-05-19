@@ -118,11 +118,6 @@ async def async_main() -> int:
             repo = AsyncCouchbaseFareRepository(config)
             await repo.connect()
 
-        worker_batch_id = args.batch_id
-
-        if args.worker_count > 1:
-            worker_batch_id = f"{args.batch_id}::worker-{args.worker_id:03d}-of-{args.worker_count:03d}"
-
         processor = AsyncFareBatchProcessor(
             repository=repo,
             dry_run=args.dry_run,
@@ -135,18 +130,17 @@ async def async_main() -> int:
             initial_load=args.initial_load,
             worker_count=args.worker_count,
             worker_id=args.worker_id,
-            parent_batch_id=args.batch_id,
         )
 
         stats = await processor.process_csv(
             csv_path=args.csv,
-            batch_id=worker_batch_id,
+            batch_id=args.batch_id,
         )
 
-        print("\n=== BATCH STATS ===")
+        print("\n=== WORKER STATS ===")
         print_json(
             {
-                "type": "fare_batch",
+                "type": "fare_batch_worker",
                 **stats.__dict__,
             }
         )

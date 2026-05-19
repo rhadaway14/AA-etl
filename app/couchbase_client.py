@@ -43,6 +43,16 @@ TRANSIENT_EXCEPTIONS = _build_transient_exceptions()
 
 
 class AsyncCouchbaseFareRepository:
+    """
+    Async Couchbase repository for high-throughput fare ingestion.
+
+    Features:
+    - async KV operations
+    - retry/backoff for transient failures
+    - hash-only collection support
+    - one shared batch_control document updated by all workers using CAS
+    """
+
     def __init__(self, config: CouchbaseConfig):
         self.config = config
         self.cluster: Cluster | None = None
@@ -245,6 +255,154 @@ class AsyncCouchbaseFareRepository:
             return await self.deadletter.upsert(key, doc)
 
         await self._retry("insert_deadletter", op)
+
+    async def upsert_batch_worker_stats(
+        self,
+        batch_id: str,
+        worker_id: int,
+        worker_count: int,
+        worker_doc: dict[str, Any],
+    ) -> None:
+        """
+        Update one shared batch_control document.
+
+        Each worker writes its own stats under:
+
+            workers.<worker_id>
+
+        This method recalculates aggregate totals on every update.
+        CAS is used to prevent workers from overwriting each other's updates.
+        """
+        worker_key = str(worker_id)
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = await self.batch.get(batch_id)
+                batch_doc = self.content_as_dict(result)
+                cas = result.cas
+
+            except DocumentNotFoundException:
+                batch_doc = {
+                    "type": "fare_batch",
+                    "batch_id": batch_id,
+                    "worker_count": worker_count,
+                    "status": "PROCESSING",
+                    "workers": {},
+                    "totals": {},
+                }
+
+                batch_doc["workers"][worker_key] = worker_doc
+                batch_doc["worker_count"] = worker_count
+                self._recalculate_batch_totals(batch_doc)
+
+                try:
+                    await self.batch.insert(batch_id, batch_doc)
+                    return
+                except DocumentExistsException:
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+
+            batch_doc.setdefault("workers", {})
+            batch_doc["workers"][worker_key] = worker_doc
+            batch_doc["worker_count"] = worker_count
+            self._recalculate_batch_totals(batch_doc)
+
+            try:
+                await self.batch.replace(batch_id, batch_doc, ReplaceOptions(cas=cas))
+                return
+            except CasMismatchException:
+                await asyncio.sleep(0.05 * (attempt + 1))
+                continue
+
+        raise RuntimeError(f"Failed to update shared batch_control document {batch_id}")
+
+    @staticmethod
+    def _recalculate_batch_totals(batch_doc: dict[str, Any]) -> None:
+        workers = batch_doc.get("workers", {})
+        worker_values = list(workers.values())
+
+        numeric_fields = [
+            "scanned_count",
+            "skipped_by_worker_count",
+            "received_count",
+            "processed_count",
+            "inserted_count",
+            "changed_count",
+            "unchanged_count",
+            "failed_count",
+            "cas_retry_count",
+            "history_duplicate_count",
+            "skipped_new_history_count",
+            "hash_match_count",
+            "hash_miss_count",
+            "hash_changed_count",
+            "hash_upsert_count",
+            "completed_count",
+            "in_flight_count",
+        ]
+
+        totals: dict[str, Any] = {}
+
+        for field in numeric_fields:
+            totals[field] = sum(
+                int(worker.get(field, 0) or 0)
+                for worker in worker_values
+            )
+
+        durations = [
+            float(worker.get("duration_seconds", 0) or 0)
+            for worker in worker_values
+        ]
+
+        wall_clock_seconds = max(durations) if durations else 0
+
+        totals["wall_clock_seconds_estimate"] = round(wall_clock_seconds, 3)
+        totals["worker_count_reported"] = len(worker_values)
+
+        if wall_clock_seconds > 0:
+            totals["aggregate_records_per_second"] = round(
+                totals["received_count"] / wall_clock_seconds,
+                2,
+            )
+            totals["aggregate_scanned_records_per_second"] = round(
+                totals["scanned_count"] / wall_clock_seconds,
+                2,
+            )
+        else:
+            totals["aggregate_records_per_second"] = None
+            totals["aggregate_scanned_records_per_second"] = None
+
+        batch_doc["totals"] = totals
+
+        expected_workers = int(batch_doc.get("worker_count", 1) or 1)
+        completed_workers = [
+            worker
+            for worker in worker_values
+            if worker.get("status") in {"COMPLETED", "COMPLETED_WITH_ERRORS"}
+        ]
+
+        if len(completed_workers) < expected_workers:
+            batch_doc["status"] = "PROCESSING"
+            batch_doc["completed_at"] = None
+        else:
+            if totals["failed_count"] > 0:
+                batch_doc["status"] = "COMPLETED_WITH_ERRORS"
+            else:
+                batch_doc["status"] = "COMPLETED"
+
+            completed_times = [
+                worker.get("completed_at")
+                for worker in worker_values
+                if worker.get("completed_at")
+            ]
+            batch_doc["completed_at"] = max(completed_times) if completed_times else None
+
+        started_times = [
+            worker.get("started_at")
+            for worker in worker_values
+            if worker.get("started_at")
+        ]
+        batch_doc["started_at"] = min(started_times) if started_times else None
 
     async def close(self) -> None:
         if self.cluster is None:
