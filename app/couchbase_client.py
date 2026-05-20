@@ -331,6 +331,7 @@ class AsyncCouchbaseFareRepository:
             "completed_count",
             "in_flight_count",
             "hash_backfill_count",
+            "current_doc_build_count"
         ]
 
         totals: dict[str, Any] = {}

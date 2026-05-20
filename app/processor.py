@@ -47,6 +47,11 @@ class BatchStats:
     hash_upsert_count: int = 0
     hash_backfill_count: int = 0
 
+    # New metric: how many full current_fares docs were actually built.
+    # In a 10M file with 100k changes, this should be close to 100k,
+    # not 10M.
+    current_doc_build_count: int = 0
+
     started_at: str = ""
     completed_at: str | None = None
 
@@ -249,7 +254,6 @@ class AsyncFareBatchProcessor:
                     row_number=row_number,
                 )
 
-                current_doc = build_current_document(parts=parts, now=now)
                 hash_key = self._hash_key_for_fare_key(parts.fare_key)
 
                 hash_doc = {
@@ -261,16 +265,21 @@ class AsyncFareBatchProcessor:
                     "updated_at": now,
                 }
 
-                items.append(
-                    {
-                        "row_number": row_number,
-                        "row": row,
-                        "parts": parts,
-                        "current_doc": current_doc,
-                        "hash_key": hash_key,
-                        "hash_doc": hash_doc,
-                    }
-                )
+                item: dict[str, Any] = {
+                    "row_number": row_number,
+                    "row": row,
+                    "parts": parts,
+                    "hash_key": hash_key,
+                    "hash_doc": hash_doc,
+                }
+
+                # Only initial-load and hash-backfill need to build docs for every row.
+                # Normal comparison mode will build current_doc lazily only for
+                # hash misses or changed hashes.
+                if self.initial_load or self.dry_run:
+                    item["current_doc"] = build_current_document(parts=parts, now=now)
+
+                items.append(item)
 
             except Exception as exc:
                 async with self._stats_lock:
@@ -293,6 +302,7 @@ class AsyncFareBatchProcessor:
                 stats,
                 processed=len(items),
                 inserted=len(items),
+                current_doc_build=len(items),
             )
             return
 
@@ -398,6 +408,7 @@ class AsyncFareBatchProcessor:
             inserted=processed,
             skipped_new_history=processed,
             hash_upsert=processed,
+            current_doc_build=len(items),
         )
 
     async def _bulk_compare_and_apply(
@@ -408,6 +419,9 @@ class AsyncFareBatchProcessor:
         batch_id: str,
         now: str,
     ) -> None:
+        # First stage: read only tiny hash docs.
+        # For unchanged rows, this is the only Couchbase read and no full
+        # current_fares doc is constructed in Python.
         hash_results = await asyncio.gather(
             *[self.repository.get_hash(item["hash_key"]) for item in items],
             return_exceptions=True,
@@ -461,6 +475,17 @@ class AsyncFareBatchProcessor:
                 hash_match=hash_match_count,
             )
             return
+
+        # Lazy document construction happens here only for candidates.
+        # In the 10M/100k-change test, this should build about 100k docs,
+        # not 10M.
+        for item in candidates:
+            item["current_doc"] = build_current_document(
+                parts=item["parts"],
+                now=now,
+            )
+
+        current_doc_build_count = len(candidates)
 
         current_results = await asyncio.gather(
             *[self.repository.get_current(item["parts"].fare_key) for item in candidates],
@@ -540,6 +565,7 @@ class AsyncFareBatchProcessor:
             hash_miss=hash_miss_count,
             hash_changed=hash_changed_count,
             hash_upsert=hash_upsert,
+            current_doc_build=current_doc_build_count,
         )
 
     async def _apply_candidate(
@@ -638,6 +664,7 @@ class AsyncFareBatchProcessor:
         hash_changed: int = 0,
         hash_upsert: int = 0,
         hash_backfill: int = 0,
+        current_doc_build: int = 0,
     ) -> None:
         async with self._stats_lock:
             stats.processed_count += processed
@@ -651,6 +678,7 @@ class AsyncFareBatchProcessor:
             stats.hash_changed_count += hash_changed
             stats.hash_upsert_count += hash_upsert
             stats.hash_backfill_count += hash_backfill
+            stats.current_doc_build_count += current_doc_build
 
     @staticmethod
     def _coerce_existing_doc(
@@ -726,6 +754,7 @@ class AsyncFareBatchProcessor:
                 f"hash_miss={stats.hash_miss_count:,} "
                 f"hash_upsert={stats.hash_upsert_count:,} "
                 f"hash_backfill={stats.hash_backfill_count:,} "
+                f"current_doc_build={stats.current_doc_build_count:,} "
                 f"assigned_rps={stats.records_per_second} "
                 f"scan_rps={stats.scanned_records_per_second}"
             ),
