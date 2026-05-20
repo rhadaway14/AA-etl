@@ -47,9 +47,8 @@ class BatchStats:
     hash_upsert_count: int = 0
     hash_backfill_count: int = 0
 
-    # New metric: how many full current_fares docs were actually built.
-    # In a 10M file with 100k changes, this should be close to 100k,
-    # not 10M.
+    # Lazy document construction metric.
+    # For a 10M file with 100k changes, this should be ~100k, not 10M.
     current_doc_build_count: int = 0
 
     started_at: str = ""
@@ -204,6 +203,51 @@ class AsyncFareBatchProcessor:
     def _hash_key_for_fare_key(fare_key: str) -> str:
         return f"hash::{fare_key}"
 
+    @staticmethod
+    def _build_tiny_hash_doc(business_hash: Any) -> dict[str, Any]:
+        """
+        Compact fare_hashes document.
+
+        Old format:
+            {
+              "type": "fare_hash",
+              "fare_key": "...",
+              "source_key": "...",
+              "business_hash": "...",
+              "last_batch_id": "...",
+              "updated_at": "..."
+            }
+
+        New format:
+            {
+              "h": "..."
+            }
+
+        The comparison hot path reads 10M of these docs, so smaller is better.
+        """
+        return {
+            "h": business_hash,
+        }
+
+    @staticmethod
+    def _hash_value_from_doc(hash_doc: dict[str, Any] | None) -> Any:
+        """
+        Read both the new tiny hash format and the old verbose format.
+
+        New:
+            {"h": "..."}
+
+        Old:
+            {"business_hash": "..."}
+        """
+        if not hash_doc:
+            return None
+
+        if "h" in hash_doc:
+            return hash_doc.get("h")
+
+        return hash_doc.get("business_hash")
+
     async def _process_chunk_safely(
         self,
         *,
@@ -255,15 +299,7 @@ class AsyncFareBatchProcessor:
                 )
 
                 hash_key = self._hash_key_for_fare_key(parts.fare_key)
-
-                hash_doc = {
-                    "type": "fare_hash",
-                    "fare_key": parts.fare_key,
-                    "source_key": parts.source_key,
-                    "business_hash": parts.business_hash,
-                    "last_batch_id": batch_id,
-                    "updated_at": now,
-                }
+                hash_doc = self._build_tiny_hash_doc(parts.business_hash)
 
                 item: dict[str, Any] = {
                     "row_number": row_number,
@@ -273,9 +309,8 @@ class AsyncFareBatchProcessor:
                     "hash_doc": hash_doc,
                 }
 
-                # Only initial-load and hash-backfill need to build docs for every row.
-                # Normal comparison mode will build current_doc lazily only for
-                # hash misses or changed hashes.
+                # Initial load still needs to build full docs for every row.
+                # Normal comparison mode does NOT build full docs here.
                 if self.initial_load or self.dry_run:
                     item["current_doc"] = build_current_document(parts=parts, now=now)
 
@@ -419,9 +454,8 @@ class AsyncFareBatchProcessor:
         batch_id: str,
         now: str,
     ) -> None:
-        # First stage: read only tiny hash docs.
-        # For unchanged rows, this is the only Couchbase read and no full
-        # current_fares doc is constructed in Python.
+        # Stage 1: read only tiny hash docs.
+        # For unchanged rows, this is the only Couchbase read.
         hash_results = await asyncio.gather(
             *[self.repository.get_hash(item["hash_key"]) for item in items],
             return_exceptions=True,
@@ -441,7 +475,7 @@ class AsyncFareBatchProcessor:
                 candidates.append(item)
                 continue
 
-            existing_hash = result.get("business_hash")
+            existing_hash = self._hash_value_from_doc(result)
 
             if existing_hash == item["parts"].business_hash:
                 hash_matches.append(item)
@@ -476,9 +510,8 @@ class AsyncFareBatchProcessor:
             )
             return
 
-        # Lazy document construction happens here only for candidates.
-        # In the 10M/100k-change test, this should build about 100k docs,
-        # not 10M.
+        # Stage 2: lazy full document construction.
+        # Only hash misses/changed rows reach this point.
         for item in candidates:
             item["current_doc"] = build_current_document(
                 parts=item["parts"],
