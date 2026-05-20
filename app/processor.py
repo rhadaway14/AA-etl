@@ -27,6 +27,7 @@ class BatchStats:
 
     worker_count: int = 1
     worker_id: int = 0
+    input_partition: bool = False
 
     scanned_count: int = 0
     skipped_by_worker_count: int = 0
@@ -72,6 +73,7 @@ class AsyncFareBatchProcessor:
         skip_new_history: bool = False,
         initial_load: bool = False,
         hash_backfill: bool = False,
+        input_partition: bool = False,
         worker_count: int = 1,
         worker_id: int = 0,
     ):
@@ -86,6 +88,7 @@ class AsyncFareBatchProcessor:
         self.skip_new_history = skip_new_history
         self.initial_load = initial_load
         self.hash_backfill = hash_backfill
+        self.input_partition = input_partition
         self.worker_count = worker_count
         self.worker_id = worker_id
 
@@ -100,6 +103,7 @@ class AsyncFareBatchProcessor:
             source_file=source_file,
             worker_count=self.worker_count,
             worker_id=self.worker_id,
+            input_partition=self.input_partition,
             started_at=utc_now_iso(),
         )
 
@@ -177,6 +181,9 @@ class AsyncFareBatchProcessor:
         return stats
 
     def _row_belongs_to_worker(self, row: dict[str, Any]) -> bool:
+        if self.input_partition:
+            return True
+
         if self.worker_count <= 1:
             return True
 
@@ -209,8 +216,6 @@ class AsyncFareBatchProcessor:
             )
 
         except Exception as exc:
-            # If something unexpected takes out the entire chunk,
-            # write each row to dead_letter so no data disappears.
             async with self._stats_lock:
                 stats.failed_count += len(chunk)
 
@@ -233,7 +238,6 @@ class AsyncFareBatchProcessor:
         stats: BatchStats,
     ) -> None:
         now = utc_now_iso()
-
         items: list[dict[str, Any]] = []
 
         for row_number, row in chunk:
@@ -405,10 +409,7 @@ class AsyncFareBatchProcessor:
         now: str,
     ) -> None:
         hash_results = await asyncio.gather(
-            *[
-                self.repository.get_hash(item["hash_key"])
-                for item in items
-            ],
+            *[self.repository.get_hash(item["hash_key"]) for item in items],
             return_exceptions=True,
         )
 
@@ -462,10 +463,7 @@ class AsyncFareBatchProcessor:
             return
 
         current_results = await asyncio.gather(
-            *[
-                self.repository.get_current(item["parts"].fare_key)
-                for item in candidates
-            ],
+            *[self.repository.get_current(item["parts"].fare_key) for item in candidates],
             return_exceptions=True,
         )
 
@@ -620,8 +618,6 @@ class AsyncFareBatchProcessor:
         )
 
         if not replaced:
-            # CAS mismatch. Let retry logic happen at row/chunk level later if needed.
-            # For now, surface as exception to dead_letter so we can see if this occurs.
             raise RuntimeError(f"CAS mismatch for {parts.fare_key}")
 
         await self.repository.upsert_hash(hash_key, hash_doc)
@@ -716,6 +712,7 @@ class AsyncFareBatchProcessor:
             (
                 f"[{label}] "
                 f"worker={stats.worker_id}/{stats.worker_count} "
+                f"input_partition={stats.input_partition} "
                 f"scanned={stats.scanned_count:,} "
                 f"assigned={stats.received_count:,} "
                 f"completed={stats.completed_count:,} "
@@ -767,6 +764,7 @@ class AsyncFareBatchProcessor:
             "row_number": row_number,
             "worker_id": self.worker_id,
             "worker_count": self.worker_count,
+            "input_partition": self.input_partition,
             "error": error,
             "traceback": traceback_text,
             "raw_record": row,
